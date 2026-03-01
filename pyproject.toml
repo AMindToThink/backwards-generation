@@ -1,0 +1,29 @@
+[project]
+name = "backward-sampler"
+version = "0.1.0"
+description = "Bayesian backward token sampling from autoregressive language models"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "transformers",
+    "scipy",
+    "numpy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/backward_sampler"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: tests that require full-vocab bigram artifacts",
+]
