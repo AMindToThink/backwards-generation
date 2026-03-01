@@ -38,10 +38,10 @@ def main() -> None:
         help="Directory to save artifacts (default: artifacts/gpt2)",
     )
     parser.add_argument(
-        "--sparsity-threshold",
+        "--top-p",
         type=float,
-        default=1e-6,
-        help="Probability threshold for sparse storage (default: 1e-6)",
+        default=0.95,
+        help="Nucleus sampling threshold for sparsification (default: 0.95)",
     )
     parser.add_argument(
         "--power-iterations",
@@ -62,7 +62,7 @@ def main() -> None:
         model=model,
         vocab_size=vocab_size,
         batch_size=args.batch_size,
-        sparsity_threshold=args.sparsity_threshold,
+        top_p=args.top_p,
         power_iterations=args.power_iterations,
     )
     elapsed = time.time() - start

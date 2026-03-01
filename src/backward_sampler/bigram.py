@@ -57,30 +57,69 @@ class BigramArtifacts:
         )
 
 
+def _apply_top_p(log_probs: np.ndarray, top_p: float) -> np.ndarray:
+    """Zero out tokens outside the top-p nucleus for each row.
+
+    Args:
+        log_probs: Array of shape (B, V) with log-probabilities.
+        top_p: Cumulative probability threshold (e.g., 0.95).
+
+    Returns:
+        Array of same shape with entries outside the nucleus set to 0.0.
+    """
+    probs = np.exp(log_probs)
+    # Sort descending along vocab axis
+    sorted_indices = np.argsort(-probs, axis=-1)
+    sorted_probs = np.take_along_axis(probs, sorted_indices, axis=-1)
+    cumulative = np.cumsum(sorted_probs, axis=-1)
+
+    # Build mask: keep tokens where cumulative prob <= top_p (plus the first one over)
+    # Shift cumulative right by 1 so we include the token that crosses the threshold
+    shifted_cumulative = np.zeros_like(cumulative)
+    shifted_cumulative[:, 1:] = cumulative[:, :-1]
+    cutoff_mask = shifted_cumulative >= top_p
+
+    # Zero out entries beyond the nucleus in the sorted order
+    sorted_probs[cutoff_mask] = 0.0
+
+    # Scatter back to original order
+    result = np.zeros_like(probs)
+    np.put_along_axis(result, sorted_indices, sorted_probs, axis=-1)
+
+    # Convert back to log-space, using 0.0 for zeroed entries (sparse sentinel)
+    with np.errstate(divide="ignore"):
+        result_log = np.where(result > 0, np.log(result), 0.0)
+
+    return result_log.astype(np.float32)
+
+
 def compute_bigram_matrix(
     model: PreTrainedModel,
     vocab_size: int,
     batch_size: int = 256,
-    sparsity_threshold: float = 1e-6,
+    top_p: float = 0.95,
 ) -> sp.csr_matrix:
     """Compute the bigram transition matrix from a language model.
 
     For each token v in the vocabulary, performs a forward pass to obtain
-    log P(w | v) for all w. Entries with P(w | v) < sparsity_threshold
-    are set to zero and the result is stored as a sparse matrix.
+    log P(w | v) for all w. Only tokens within the top-p nucleus are kept;
+    the rest are zeroed out for sparse storage.
+
+    This assumes the forward model will be sampled with top-p nucleus
+    sampling at the same threshold, which is standard practice.
 
     Args:
         model: A causal language model in eval mode.
         vocab_size: Size of the token vocabulary.
         batch_size: Number of tokens to process in each forward pass.
-        sparsity_threshold: Probability values below this are zeroed out.
+        top_p: Nucleus sampling threshold. Only the smallest set of tokens
+            whose cumulative probability exceeds top_p are retained per row.
 
     Returns:
         Sparse CSR matrix of shape (vocab_size, vocab_size) containing
         log-probabilities.
     """
     device = next(model.parameters()).device
-    log_threshold = np.log(sparsity_threshold)
 
     rows: list[sp.csr_matrix] = []
 
@@ -96,12 +135,11 @@ def compute_bigram_matrix(
         # Truncate to vocab_size columns (relevant when computing for a subset)
         log_probs = log_probs[:, :vocab_size]
 
-        # Zero out entries below threshold (in probability space)
-        mask = log_probs < log_threshold
-        log_probs[mask] = 0.0
+        # Apply top-p nucleus filtering
+        log_probs = _apply_top_p(log_probs, top_p)
 
         # Convert batch to sparse rows
-        batch_sparse = sp.csr_matrix(log_probs.astype(np.float32))
+        batch_sparse = sp.csr_matrix(log_probs)
         rows.append(batch_sparse)
 
     # Stack all rows into a single sparse matrix
@@ -151,14 +189,17 @@ def compute_unigram_distribution(
     # Equivalently: p_{n+1} = prob_matrix.T @ p_n
     p = np.ones(vocab_size, dtype=np.float64) / vocab_size
 
-    for i in range(n_iterations):
+    pbar = trange(n_iterations, desc="Power iteration")
+    for i in pbar:
         p_new = prob_matrix.T @ p
         p_new = p_new / p_new.sum()  # normalize
 
         delta = np.abs(p_new - p).sum()
         p = p_new
+        pbar.set_postfix(delta=f"{delta:.2e}")
 
         if delta < tolerance:
+            pbar.set_description("Power iteration (converged)")
             break
 
     # Convert to log-space
@@ -173,7 +214,7 @@ def precompute_artifacts(
     model: PreTrainedModel,
     vocab_size: int,
     batch_size: int = 256,
-    sparsity_threshold: float = 1e-6,
+    top_p: float = 0.95,
     power_iterations: int = 100,
 ) -> BigramArtifacts:
     """Run the full bigram precomputation pipeline.
@@ -182,14 +223,14 @@ def precompute_artifacts(
         model: A causal language model in eval mode.
         vocab_size: Size of the token vocabulary.
         batch_size: Batch size for forward passes.
-        sparsity_threshold: Probability cutoff for sparse storage.
+        top_p: Nucleus sampling threshold for sparse storage.
         power_iterations: Number of power iteration steps for unigram.
 
     Returns:
         BigramArtifacts containing the bigram matrix and unigram distribution.
     """
     log_bigram_csr = compute_bigram_matrix(
-        model, vocab_size, batch_size, sparsity_threshold
+        model, vocab_size, batch_size, top_p
     )
     log_unigram = compute_unigram_distribution(log_bigram_csr, power_iterations)
     log_bigram_csc = log_bigram_csr.tocsc()
