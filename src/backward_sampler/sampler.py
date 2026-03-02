@@ -28,14 +28,19 @@ def compute_log_z(
 ) -> float:
     """Compute the log-probability of a suffix: log P(s₁, ..., s_T).
 
-    Uses the precomputed unigram distribution for the first token and
-    the forward model for the remaining conditional probabilities:
-        log Z = log P_unigram(s₁) + Σᵢ₌₂ᵀ log P_LM(sᵢ | s₁, ..., sᵢ₋₁)
+    Uses the bigram stationary distribution for the first token and
+    the LM's own conditionals for the rest:
+        log Z = log π(s₁) + Σᵢ₌₂ᵀ log P_LM(sᵢ | s₁, ..., sᵢ₋₁)
+
+    π(s₁) is the correct marginal because Σ_v P(s₁|v)×π(v) = π(s₁)
+    by definition of the stationary distribution. The LM conditionals
+    for i≥2 approximate the true marginal (which would require summing
+    over v) but are accurate when the suffix context dominates.
 
     Args:
         model: A causal language model in eval mode.
         suffix_ids: Token IDs of the suffix sequence.
-        log_unigram: Precomputed log-unigram distribution.
+        log_unigram: Precomputed log-unigram (stationary) distribution.
 
     Returns:
         log Z as a float.
@@ -53,6 +58,7 @@ def compute_log_z(
         log_probs = F.log_softmax(logits, dim=-1)  # (1, T, V)
 
         # Accumulate log P(sᵢ | s₁...sᵢ₋₁) for i = 2..T
+        # Position i-1 predicts sᵢ; position T-1 predicts beyond suffix (ignored)
         for i in range(1, len(suffix_ids)):
             log_z += log_probs[0, i - 1, suffix_ids[i]].item()
 

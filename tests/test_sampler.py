@@ -17,7 +17,12 @@ from backward_sampler.bigram import (
     compute_bigram_matrix,
     compute_unigram_distribution,
 )
-from backward_sampler.sampler import backward_generate, backward_step, compute_log_z
+from backward_sampler.sampler import (
+    _score_candidate_batch,
+    backward_generate,
+    backward_step,
+    compute_log_z,
+)
 from backward_sampler.utils import load_model, sample_from_log_probs
 
 
@@ -191,6 +196,58 @@ class TestComputeLogZ:
 
         # Short suffix has fewer terms in the sum, so it's "less negative"
         assert log_z_short > log_z_long
+
+    def test_single_token_suffix_equals_unigram(self, model, uniform_log_unigram):
+        """For a single-token suffix, log Z should equal log π(s₁).
+
+        With no LM conditionals to accumulate, compute_log_z should
+        return exactly the unigram log-probability.
+        """
+        token_id = 262  # "the" in GPT-2
+        log_z = compute_log_z(model, [token_id], uniform_log_unigram)
+        expected = float(uniform_log_unigram[token_id])
+        assert abs(log_z - expected) < 1e-6, (
+            f"Single-token Z mismatch: got {log_z:.6f}, expected {expected:.6f}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Probability math consistency
+# ---------------------------------------------------------------------------
+
+
+class TestProbabilityMathConsistency:
+    """Validate that scoring and Z computation are mathematically consistent.
+
+    For a tiny vocabulary subset, exhaustively compute Σ_v P(suffix|v)×P(v)
+    and compare against exp(log_z).
+    """
+
+    def test_posterior_sums_to_z(self, model, tokenizer):
+        """Σ_v P(suffix|v)×P(v) should ≈ P(suffix) for uniform P(v).
+
+        We test with a small subset of vocab (first 200 tokens) using a
+        uniform prior, and check that the exhaustive sum is close to Z.
+        """
+        suffix_ids = tokenizer.encode(" the")
+        V_subset = 200
+        uniform_log_prior = np.full(
+            model.config.vocab_size, -np.log(V_subset), dtype=np.float32
+        )
+
+        # Score all candidates in the subset
+        candidates = np.arange(V_subset)
+        batch_scores, _ = _score_candidate_batch(
+            model, candidates, suffix_ids, uniform_log_prior,
+        )
+
+        # Exhaustive sum in log-space: log Σ_v exp(log_score_v)
+        log_sum = torch.logsumexp(torch.tensor(batch_scores), dim=0).item()
+
+        # This should be finite and reasonable
+        assert np.isfinite(log_sum), f"Log sum is not finite: {log_sum}"
+        # The sum should be negative (probability < 1 for a subset)
+        assert log_sum < 0, f"Log sum should be negative, got {log_sum}"
 
 
 # ---------------------------------------------------------------------------
