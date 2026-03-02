@@ -2,12 +2,13 @@
 
 Usage:
     uv run scripts/backward_generate.py --suffix "is the capital of France"
-    uv run scripts/backward_generate.py --suffix "is the capital of France" --max-tokens 10 --verbose
+    uv run scripts/backward_generate.py --suffix "is the capital of France" --max-tokens 10 --stream
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 
 from backward_sampler.bigram import BigramArtifacts
 from backward_sampler.sampler import backward_generate
@@ -49,15 +50,32 @@ def main() -> None:
         help="Nucleus stopping threshold (default: 0.9)",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=256,
+        help="Number of candidates to score per forward pass (default: 256)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature: <1 sharpens, >1 flattens (default: 1.0)",
+    )
+    parser.add_argument(
         "--num-samples",
         type=int,
         default=5,
         help="Number of independent samples to generate (default: 5)",
     )
     parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream tokens as they are generated (printed right-to-left)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print each generated token",
+        help="Print each generated token on its own line",
     )
     args = parser.parse_args()
 
@@ -72,6 +90,22 @@ def main() -> None:
     print()
 
     for i in range(args.num_samples):
+        # For streaming, we collect tokens and redisplay the growing prefix
+        generated_tokens: list[str] = []
+
+        def on_token(token_id: int, decoded: str, step: int) -> None:
+            generated_tokens.insert(0, decoded)
+            # Rewrite line: show growing prefix + suffix
+            prefix = "".join(generated_tokens)
+            line = f"\r  [{i + 1}] {prefix}{args.suffix}"
+            sys.stdout.write(f"\033[2K{line}")
+            sys.stdout.flush()
+
+        if args.stream:
+            # Print suffix first
+            sys.stdout.write(f"  [{i + 1}] {args.suffix}")
+            sys.stdout.flush()
+
         result = backward_generate(
             model=model,
             tokenizer=tokenizer,
@@ -79,9 +113,19 @@ def main() -> None:
             artifacts=artifacts,
             max_new_tokens=args.max_tokens,
             threshold=args.threshold,
+            batch_size=args.batch_size,
+            temperature=args.temperature,
             verbose=args.verbose,
+            on_token=on_token if args.stream else None,
         )
-        print(f"[{i + 1}] {result}")
+
+        if args.stream:
+            # Final line with full decoded result (may differ slightly from
+            # concatenated tokens due to tokenizer merging)
+            sys.stdout.write(f"\033[2K\r  [{i + 1}] {result}\n")
+            sys.stdout.flush()
+        else:
+            print(f"  [{i + 1}] {result}")
 
 
 if __name__ == "__main__":

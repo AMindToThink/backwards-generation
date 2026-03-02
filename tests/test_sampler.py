@@ -163,28 +163,33 @@ class TestArtifactIO:
 
 
 class TestComputeLogZ:
-    def test_returns_finite(self, model, tokenizer):
+    @pytest.fixture()
+    def uniform_log_unigram(self, model):
+        """Uniform log-unigram for testing (full vocab)."""
+        V = model.config.vocab_size
+        return np.full(V, -np.log(V), dtype=np.float32)
+
+    def test_returns_finite(self, model, tokenizer, uniform_log_unigram):
         """Log Z should be a finite number."""
         suffix_ids = tokenizer.encode("the cat sat on")
-        log_z = compute_log_z(model, suffix_ids)
+        log_z = compute_log_z(model, suffix_ids, uniform_log_unigram)
         assert np.isfinite(log_z)
 
-    def test_negative_value(self, model, tokenizer):
+    def test_negative_value(self, model, tokenizer, uniform_log_unigram):
         """Log Z should be negative (probability < 1)."""
         suffix_ids = tokenizer.encode("the cat sat on the mat")
-        log_z = compute_log_z(model, suffix_ids)
+        log_z = compute_log_z(model, suffix_ids, uniform_log_unigram)
         assert log_z < 0
 
-    def test_shorter_suffix_higher_prob(self, model, tokenizer):
+    def test_shorter_suffix_higher_prob(self, model, tokenizer, uniform_log_unigram):
         """A very common short suffix should have higher log-prob than a long one."""
         short_ids = tokenizer.encode("the")
         long_ids = tokenizer.encode("the cat sat on the mat in the house")
 
-        log_z_short = compute_log_z(model, short_ids)
-        log_z_long = compute_log_z(model, long_ids)
+        log_z_short = compute_log_z(model, short_ids, uniform_log_unigram)
+        log_z_long = compute_log_z(model, long_ids, uniform_log_unigram)
 
         # Short suffix has fewer terms in the sum, so it's "less negative"
-        # (though this isn't strictly guaranteed, it's very likely for these examples)
         assert log_z_short > log_z_long
 
 
