@@ -55,6 +55,18 @@ uv run python scripts/backward_generate.py \
   --num-samples 3 \
   --max-tokens 5 \
   --heuristic forward-prompt
+
+# Generate with reversed-sequence heuristic
+uv run python scripts/backward_generate.py \
+  --suffix " is the capital of France" \
+  --model-name openai-community/gpt2-xl \
+  --device cuda:0 \
+  --batch-size 512 \
+  --threshold 0.9 \
+  --temperature 0.5 \
+  --num-samples 3 \
+  --max-tokens 5 \
+  --heuristic reversed
 ```
 
 ## Candidate ordering heuristics
@@ -65,6 +77,7 @@ The `--heuristic` flag controls how candidates are ordered for evaluation. The o
 |-----------|-------------|-------|
 | `bigram` (default) | Orders candidates by reverse bigram probability `P(v\|s₁)` from the precomputed sparse matrix. Only evaluates tokens with nonzero bigram probability. | Fast when bigrams are unsparsified |
 | `forward-prompt` | Uses a few-shot cloze prompt to get the LM's own prediction for what precedes the suffix. Evaluates all ~50k tokens, sorted by heuristic probability. | ~1 extra forward pass per step |
+| `reversed` | Feeds the LM a long passage with tokens reversed, plus the reversed suffix. In-context learning on the reversed text teaches the model to predict predecessors. | ~1 extra forward pass per step |
 
 ## Example output
 
@@ -97,6 +110,6 @@ Any HuggingFace causal LM works. The bigram artifacts are tokenizer-specific, so
 ## Tests
 
 ```bash
-uv run pytest tests/ -v -m "not slow"  # fast tests (20 tests)
+uv run pytest tests/ -v -m "not slow"  # fast tests (24 tests)
 uv run pytest tests/ -v -m slow        # requires precomputed artifacts
 ```

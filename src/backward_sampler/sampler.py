@@ -16,6 +16,7 @@ from typing import Literal
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from backward_sampler.bigram import BigramArtifacts
@@ -96,6 +97,21 @@ def _get_candidate_order(
     return nonzero_indices[sorted_order]
 
 
+_REVERSED_PASSAGE = (
+    "The history of the United States began with the arrival of Native Americans"
+    " in North America around 15,000 BC. Numerous indigenous cultures formed, and"
+    " many saw transformations in the 16th century with European colonization."
+    " The thirteen colonies were established along the Eastern seaboard, and"
+    " tensions with Britain led to the American Revolution. The Declaration of"
+    " Independence was adopted on July 4, 1776, proclaiming the colonies' right"
+    " to self-determination. After the war, the Constitution was drafted in 1787,"
+    " establishing a federal government. The Bill of Rights, comprising the first"
+    " ten amendments, was ratified in 1791 to guarantee individual freedoms."
+    " Westward expansion, the Louisiana Purchase, and the concept of Manifest"
+    " Destiny shaped the young nation throughout the 19th century."
+)
+
+
 _CLOZE_PROMPT = '''\
 Fill in the blank token in each example.
 
@@ -139,6 +155,52 @@ def _get_forward_prompt_order(
     # Take logits at the last position — the LM's prediction for the blank
     last_logits = logits[0, -1, :]  # (V,)
     # Sort all tokens by descending probability
+    sorted_indices = torch.argsort(last_logits, descending=True)
+    return sorted_indices.cpu().numpy()
+
+
+def _get_reversed_prompt_order(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    suffix_ids: list[int],
+) -> np.ndarray:
+    """Get candidate predecessor tokens by feeding reversed text to the LM.
+
+    Tokenizes a long passage, reverses the token order, appends the reversed
+    suffix, and uses the model's next-token prediction as a heuristic for
+    predecessor probability. The idea is that in-context learning on a long
+    reversed example teaches the model to predict predecessors.
+
+    Args:
+        model: A causal language model in eval mode.
+        tokenizer: The model's tokenizer.
+        suffix_ids: Token IDs of the current suffix.
+
+    Returns:
+        Array of ALL token IDs sorted by descending heuristic probability.
+    """
+    # Tokenize passage and reverse
+    passage_ids = tokenizer.encode(_REVERSED_PASSAGE)
+    reversed_passage_ids = passage_ids[::-1]
+
+    # Append reversed suffix
+    reversed_suffix_ids = suffix_ids[::-1]
+    combined = reversed_passage_ids + reversed_suffix_ids
+
+    # Truncate passage from the left if exceeding context window
+    max_len = 1024
+    if len(combined) > max_len:
+        excess = len(combined) - max_len
+        combined = combined[excess:]
+
+    device = next(model.parameters()).device
+    input_ids = torch.tensor([combined], device=device)
+
+    with torch.no_grad():
+        logits = model(input_ids=input_ids).logits  # (1, seq_len, V)
+
+    # Take logits at the last position
+    last_logits = logits[0, -1, :]  # (V,)
     sorted_indices = torch.argsort(last_logits, descending=True)
     return sorted_indices.cpu().numpy()
 
@@ -204,7 +266,7 @@ def backward_step(
     threshold: float = 0.9,
     batch_size: int = 256,
     temperature: float = 1.0,
-    heuristic: Literal["bigram", "forward-prompt"] = "bigram",
+    heuristic: Literal["bigram", "forward-prompt", "reversed"] = "bigram",
     tokenizer: PreTrainedTokenizerBase | None = None,
 ) -> int:
     """Sample a single token to prepend to the suffix.
@@ -226,16 +288,17 @@ def backward_step(
         temperature: Sampling temperature. <1 sharpens the distribution,
             >1 flattens it. Default 1.0 (no scaling).
         heuristic: Candidate ordering strategy. "bigram" uses the precomputed
-            reverse bigram matrix; "forward-prompt" uses a cloze-style LM prompt.
-        tokenizer: Required when heuristic="forward-prompt".
+            reverse bigram matrix; "forward-prompt" uses a cloze-style LM prompt;
+            "reversed" feeds reversed text to the LM.
+        tokenizer: Required when heuristic="forward-prompt" or "reversed".
 
     Returns:
         Sampled token ID to prepend to the suffix.
     """
 
     # Validate parameters early
-    if heuristic == "forward-prompt" and tokenizer is None:
-        raise ValueError("tokenizer is required for heuristic='forward-prompt'")
+    if heuristic in ("forward-prompt", "reversed") and tokenizer is None:
+        raise ValueError(f"tokenizer is required for heuristic='{heuristic}'")
 
     # Step 1: Compute Z = P(suffix)
     log_z = compute_log_z(model, suffix_ids, artifacts.log_unigram)
@@ -247,6 +310,12 @@ def backward_step(
         # Only the Bayesian nucleus stopping criterion may prune candidates.
         assert len(candidates) == tokenizer.vocab_size, (
             f"Forward-prompt heuristic must return all {tokenizer.vocab_size} tokens, "
+            f"got {len(candidates)}. Do not apply top-p to the heuristic."
+        )
+    elif heuristic == "reversed":
+        candidates = _get_reversed_prompt_order(model, tokenizer, suffix_ids)
+        assert len(candidates) == tokenizer.vocab_size, (
+            f"Reversed heuristic must return all {tokenizer.vocab_size} tokens, "
             f"got {len(candidates)}. Do not apply top-p to the heuristic."
         )
     else:
@@ -261,8 +330,15 @@ def backward_step(
     all_log_scores: list[float] = []
     all_token_ids: list[int] = []
     accumulated_log_mass = float("-inf")  # log(0)
+    n_batches = (len(candidates) + batch_size - 1) // batch_size
 
-    for batch_start in range(0, len(candidates), batch_size):
+    pbar = tqdm(
+        range(0, len(candidates), batch_size),
+        total=n_batches,
+        desc="  Scoring candidates",
+        leave=False,
+    )
+    for batch_start in pbar:
         batch_end = min(batch_start + batch_size, len(candidates))
         batch_tokens = candidates[batch_start:batch_end]
 
@@ -277,9 +353,14 @@ def backward_step(
             torch.tensor(all_log_scores), dim=0
         ).item()
 
+        # Show coverage in the progress bar
+        coverage = np.exp(accumulated_log_mass - log_z)
+        pbar.set_postfix(coverage=f"{coverage:.1%}")
+
         # Check nucleus stopping criterion
         if accumulated_log_mass - log_z > np.log(threshold):
             break
+    pbar.close()
 
     # Step 4: Sample from normalized distribution (with temperature)
     log_scores_tensor = torch.tensor(all_log_scores) / temperature
@@ -299,7 +380,7 @@ def backward_generate(
     temperature: float = 1.0,
     verbose: bool = False,
     on_token: Callable[[int, str, int], None] | None = None,
-    heuristic: Literal["bigram", "forward-prompt"] = "bigram",
+    heuristic: Literal["bigram", "forward-prompt", "reversed"] = "bigram",
 ) -> str:
     """Generate tokens backward (prepend) until BOS or max length.
 
@@ -324,7 +405,8 @@ def backward_generate(
     suffix_ids = tokenizer.encode(suffix)
     eos_token_id = tokenizer.eos_token_id
 
-    for step in range(max_new_tokens):
+    pbar = tqdm(range(max_new_tokens), desc="Backward steps", leave=False)
+    for step in pbar:
         token = backward_step(
             model,
             suffix_ids,
@@ -347,10 +429,13 @@ def backward_generate(
         suffix_ids = [token] + suffix_ids
         decoded = tokenizer.decode([token])
 
+        pbar.set_postfix(token=decoded.strip() or repr(decoded))
+
         if verbose:
             print(f"[Step {step + 1}] Sampled: {decoded!r}")
 
         if on_token is not None:
             on_token(token, decoded, step + 1)
+    pbar.close()
 
     return tokenizer.decode(suffix_ids)

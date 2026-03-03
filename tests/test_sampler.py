@@ -19,6 +19,7 @@ from backward_sampler.bigram import (
 )
 from backward_sampler.sampler import (
     _get_forward_prompt_order,
+    _get_reversed_prompt_order,
     _score_candidate_batch,
     backward_generate,
     backward_step,
@@ -371,3 +372,35 @@ class TestBackwardStepForwardPrompt:
                 heuristic="forward-prompt",
                 tokenizer=None,
             )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Reversed prompt heuristic
+# ---------------------------------------------------------------------------
+
+
+class TestReversedPromptOrder:
+    def test_returns_full_vocab(self, model, tokenizer):
+        """_get_reversed_prompt_order should return all vocab tokens."""
+        suffix_ids = tokenizer.encode(" is the capital of France")
+        order = _get_reversed_prompt_order(model, tokenizer, suffix_ids)
+        assert len(order) == tokenizer.vocab_size
+
+    def test_valid_token_ids(self, model, tokenizer):
+        """All returned token IDs should be in [0, vocab_size)."""
+        suffix_ids = tokenizer.encode(" the cat")
+        order = _get_reversed_prompt_order(model, tokenizer, suffix_ids)
+        assert np.all(order >= 0)
+        assert np.all(order < tokenizer.vocab_size)
+
+    def test_no_duplicates(self, model, tokenizer):
+        """Returned array should contain no duplicate token IDs."""
+        suffix_ids = tokenizer.encode(" hello world")
+        order = _get_reversed_prompt_order(model, tokenizer, suffix_ids)
+        assert len(np.unique(order)) == len(order)
+
+    def test_returns_numpy_array(self, model, tokenizer):
+        """Return type should be a numpy array."""
+        suffix_ids = tokenizer.encode(" test")
+        order = _get_reversed_prompt_order(model, tokenizer, suffix_ids)
+        assert isinstance(order, np.ndarray)

@@ -63,7 +63,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--heuristic",
-        choices=["bigram", "forward-prompt"],
+        choices=["bigram", "forward-prompt", "reversed"],
         default="bigram",
         help="Candidate ordering heuristic (default: bigram)",
     )
