@@ -62,6 +62,12 @@ def main() -> None:
         help="Sampling temperature: <1 sharpens, >1 flattens (default: 1.0)",
     )
     parser.add_argument(
+        "--heuristic",
+        choices=["bigram", "forward-prompt"],
+        default="bigram",
+        help="Candidate ordering heuristic (default: bigram)",
+    )
+    parser.add_argument(
         "--num-samples",
         type=int,
         default=5,
@@ -117,6 +123,7 @@ def main() -> None:
             temperature=args.temperature,
             verbose=args.verbose,
             on_token=on_token if args.stream else None,
+            heuristic=args.heuristic,
         )
 
         if args.stream:

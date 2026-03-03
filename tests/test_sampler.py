@@ -18,6 +18,7 @@ from backward_sampler.bigram import (
     compute_unigram_distribution,
 )
 from backward_sampler.sampler import (
+    _get_forward_prompt_order,
     _score_candidate_batch,
     backward_generate,
     backward_step,
@@ -311,3 +312,62 @@ class TestBackwardGenerate:
             model, tokenizer, suffix, full_artifacts, max_new_tokens=5
         )
         assert result.endswith(suffix) or suffix.strip() in result
+
+
+# ---------------------------------------------------------------------------
+# Tests: Forward prompt heuristic
+# ---------------------------------------------------------------------------
+
+
+class TestForwardPromptOrder:
+    def test_returns_full_vocab(self, model, tokenizer):
+        """_get_forward_prompt_order should return all vocab tokens."""
+        suffix_ids = tokenizer.encode(" is the capital of France")
+        order = _get_forward_prompt_order(model, tokenizer, suffix_ids)
+        assert len(order) == tokenizer.vocab_size
+
+    def test_valid_token_ids(self, model, tokenizer):
+        """All returned token IDs should be in [0, vocab_size)."""
+        suffix_ids = tokenizer.encode(" the cat")
+        order = _get_forward_prompt_order(model, tokenizer, suffix_ids)
+        assert np.all(order >= 0)
+        assert np.all(order < tokenizer.vocab_size)
+
+    def test_no_duplicates(self, model, tokenizer):
+        """Returned array should contain no duplicate token IDs."""
+        suffix_ids = tokenizer.encode(" hello world")
+        order = _get_forward_prompt_order(model, tokenizer, suffix_ids)
+        assert len(np.unique(order)) == len(order)
+
+    def test_returns_numpy_array(self, model, tokenizer):
+        """Return type should be a numpy array."""
+        suffix_ids = tokenizer.encode(" test")
+        order = _get_forward_prompt_order(model, tokenizer, suffix_ids)
+        assert isinstance(order, np.ndarray)
+
+
+class TestBackwardStepForwardPrompt:
+    @pytest.mark.slow
+    def test_returns_valid_token(self, model, tokenizer, full_artifacts):
+        """backward_step with forward-prompt heuristic should return a valid token."""
+        suffix_ids = tokenizer.encode(" is the capital of France")
+        token = backward_step(
+            model,
+            suffix_ids,
+            full_artifacts,
+            heuristic="forward-prompt",
+            tokenizer=tokenizer,
+        )
+        assert 0 <= token < model.config.vocab_size
+
+    def test_requires_tokenizer(self, model, tokenizer, small_artifacts):
+        """forward-prompt heuristic should raise ValueError without tokenizer."""
+        suffix_ids = tokenizer.encode(" test")
+        with pytest.raises(ValueError, match="tokenizer is required"):
+            backward_step(
+                model,
+                suffix_ids,
+                small_artifacts,
+                heuristic="forward-prompt",
+                tokenizer=None,
+            )

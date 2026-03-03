@@ -11,6 +11,7 @@ The bigram table guides candidate ordering; the LM scores the full suffix.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Literal
 
 import numpy as np
 import torch
@@ -95,6 +96,53 @@ def _get_candidate_order(
     return nonzero_indices[sorted_order]
 
 
+_CLOZE_PROMPT = '''\
+Fill in the blank token in each example.
+
+Text: "ed the basics of the game" → Blank: "learn"
+Text: " you doing today?" → Blank: " are"
+Text: "'t believe it" → Blank: "don"
+Text: ".\\n\\nThe first" → Blank: "\\n"
+Text: " is the capital of France." → Blank: " Paris"
+Text: "{suffix_text}" → Blank: "'''
+
+
+def _get_forward_prompt_order(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    suffix_ids: list[int],
+) -> np.ndarray:
+    """Get candidate predecessor tokens sorted by a cloze-style forward prompt.
+
+    Builds a few-shot prompt that teaches the LM to predict the token
+    preceding a given suffix, then returns all vocab tokens sorted by
+    the LM's predicted probability (descending).
+
+    Args:
+        model: A causal language model in eval mode.
+        tokenizer: The model's tokenizer.
+        suffix_ids: Token IDs of the current suffix.
+
+    Returns:
+        Array of ALL token IDs sorted by descending heuristic probability.
+    """
+    suffix_text = tokenizer.decode(suffix_ids)
+    prompt = _CLOZE_PROMPT.format(suffix_text=suffix_text)
+    prompt_ids = tokenizer.encode(prompt)
+
+    device = next(model.parameters()).device
+    input_ids = torch.tensor([prompt_ids], device=device)
+
+    with torch.no_grad():
+        logits = model(input_ids=input_ids).logits  # (1, seq_len, V)
+
+    # Take logits at the last position — the LM's prediction for the blank
+    last_logits = logits[0, -1, :]  # (V,)
+    # Sort all tokens by descending probability
+    sorted_indices = torch.argsort(last_logits, descending=True)
+    return sorted_indices.cpu().numpy()
+
+
 def _score_candidate_batch(
     model: PreTrainedModel,
     candidate_tokens: np.ndarray,
@@ -156,12 +204,14 @@ def backward_step(
     threshold: float = 0.9,
     batch_size: int = 256,
     temperature: float = 1.0,
+    heuristic: Literal["bigram", "forward-prompt"] = "bigram",
+    tokenizer: PreTrainedTokenizerBase | None = None,
 ) -> int:
     """Sample a single token to prepend to the suffix.
 
     Implements the core Bayesian backward sampling step:
     1. Compute Z (suffix log-probability) via forward pass
-    2. Iterate candidates in bigram-sorted order
+    2. Iterate candidates in heuristic-sorted order
     3. Score each: log P(suffix | v) + log P(v) via forward pass on [v]+suffix
     4. Stop when accumulated mass exceeds threshold × Z
     5. Sample from normalized scores (with temperature)
@@ -175,17 +225,33 @@ def backward_step(
         batch_size: Number of candidates to score per forward pass.
         temperature: Sampling temperature. <1 sharpens the distribution,
             >1 flattens it. Default 1.0 (no scaling).
+        heuristic: Candidate ordering strategy. "bigram" uses the precomputed
+            reverse bigram matrix; "forward-prompt" uses a cloze-style LM prompt.
+        tokenizer: Required when heuristic="forward-prompt".
 
     Returns:
         Sampled token ID to prepend to the suffix.
     """
 
+    # Validate parameters early
+    if heuristic == "forward-prompt" and tokenizer is None:
+        raise ValueError("tokenizer is required for heuristic='forward-prompt'")
+
     # Step 1: Compute Z = P(suffix)
     log_z = compute_log_z(model, suffix_ids, artifacts.log_unigram)
 
-    # Step 2: Get candidate order from reverse bigram
-    s1 = suffix_ids[0]
-    candidates = _get_candidate_order(artifacts, s1)
+    # Step 2: Get candidate order from heuristic
+    if heuristic == "forward-prompt":
+        candidates = _get_forward_prompt_order(model, tokenizer, suffix_ids)
+        # DO NOT REMOVE: The heuristic must return ALL tokens. No top-p filtering.
+        # Only the Bayesian nucleus stopping criterion may prune candidates.
+        assert len(candidates) == tokenizer.vocab_size, (
+            f"Forward-prompt heuristic must return all {tokenizer.vocab_size} tokens, "
+            f"got {len(candidates)}. Do not apply top-p to the heuristic."
+        )
+    else:
+        s1 = suffix_ids[0]
+        candidates = _get_candidate_order(artifacts, s1)
 
     if len(candidates) == 0:
         # Fallback: if no bigram candidates, sample from unigram
@@ -233,6 +299,7 @@ def backward_generate(
     temperature: float = 1.0,
     verbose: bool = False,
     on_token: Callable[[int, str, int], None] | None = None,
+    heuristic: Literal["bigram", "forward-prompt"] = "bigram",
 ) -> str:
     """Generate tokens backward (prepend) until BOS or max length.
 
@@ -248,6 +315,8 @@ def backward_generate(
         verbose: If True, print each generated token.
         on_token: Optional callback invoked after each token is sampled.
             Called with (token_id, decoded_text, step_number).
+        heuristic: Candidate ordering strategy. "bigram" uses the precomputed
+            reverse bigram matrix; "forward-prompt" uses a cloze-style LM prompt.
 
     Returns:
         The full generated sequence (prefix + suffix) as a string.
@@ -263,6 +332,8 @@ def backward_generate(
             threshold=threshold,
             batch_size=batch_size,
             temperature=temperature,
+            heuristic=heuristic,
+            tokenizer=tokenizer,
         )
 
         # GPT-2 uses the same token (50256) for BOS and EOS

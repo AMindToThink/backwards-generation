@@ -12,14 +12,16 @@
 ### Phase 2: Single-Step Backward Sampler (`sampler.py`)
 - Scores candidates using full suffix: `log P(suffix | v) + log P(v)`
 - Forward pass on `[v, s₁, ..., s_T]` for each candidate batch
-- Bigram table orders candidates (which to evaluate first)
+- Two candidate ordering heuristics (--heuristic flag):
+  - **bigram** (default): orders by reverse bigram probability P(v|s₁)
+  - **forward-prompt**: uses a few-shot cloze prompt to get the LM's own prediction for what precedes the suffix, then sorts all ~50k tokens by that heuristic probability
 - Nucleus stopping criterion compares accumulated mass to Z = P(suffix)
 - Temperature parameter for controlling sampling sharpness
 
 ### Phase 3: Multi-Step Generation (`sampler.py` + `scripts/backward_generate.py`)
 - Iterative prepending loop with BOS stopping
 - Streaming output (--stream flag)
-- CLI with full configurability: --batch-size, --threshold, --temperature, etc.
+- CLI with full configurability: --batch-size, --threshold, --temperature, --heuristic, etc.
 
 ## Known Issues
 
@@ -41,8 +43,22 @@ The posterior distribution over predecessor tokens is genuinely high-entropy —
 ### 3. GPT-2 is a weak model
 GPT-2 (137M params) has limited contextual understanding. A stronger model would likely produce sharper posteriors and better backward samples.
 
+## Forward-Prompt Heuristic Results
+
+Benchmarked on GPT-2 XL (1.6B), suffix `" is the capital of France"`, 3 samples × 5 max tokens, batch_size=512, temperature=0.5, cuda:0 (Quadro RTX 8000).
+
+| Threshold | Time | Output samples |
+|-----------|------|----------------|
+| 0.95 | 16m 51s | "Paris in Paris. Paris", "live in Paris. Paris", "Paris.\n\nParis" |
+| 0.90 | 14m 46s | "middle of Paris. Paris", "party.\n\nParis", "Paris.\n\nParis" |
+
+- ~1 min per backward step at both thresholds (dominated by candidate batch scoring, not the heuristic forward pass)
+- Lowering threshold from 0.95 → 0.90 gives ~12% speedup
+- Output quality is reasonable — "Paris" appears consistently
+- The heuristic orders all ~50k tokens, but the nucleus stopping criterion still evaluates many batches before reaching the threshold, because the cloze prompt's top predictions don't fully concentrate Bayesian mass
+
 ## Test Results
-- 13 non-slow tests pass (bigram shape, unigram convergence, artifact I/O, log-Z, sampling utilities)
+- 20 non-slow tests pass (bigram shape, unigram convergence, artifact I/O, log-Z, sampling utilities, forward-prompt ordering)
 - Slow tests (requiring full artifacts) not yet validated with the new full-suffix scoring
 
 ## File Summary
